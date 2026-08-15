@@ -6,10 +6,13 @@ import { FuzzyPatchEngine, PatchMatchResult, ReplacementChunk } from './fuzzy.js
 export interface SmartPatchConfig {
   /** Create automatic .bak backup files before modifying. Default: false */
   createBackup?: boolean
+  /** Restrict file modifications strictly within this workspace root directory */
+  workspaceRoot?: string
 }
 
 export const SmartPatchConfig: Schema<SmartPatchConfig> = Schema.object({
   createBackup: Schema.boolean().default(false).description('Create .bak backup files before applying patches.'),
+  workspaceRoot: Schema.string().default('').description('Restrict file modifications within workspace root.'),
 })
 
 declare module 'cordis' {
@@ -21,20 +24,38 @@ declare module 'cordis' {
 /**
  * DeepSeek Harness Micro-surgical Code Patching Service.
  */
-export class SmartPatchService extends Service {
-  constructor(ctx: Context, private config: SmartPatchConfig = {}) {
+export class SmartPatchService extends Service<SmartPatchConfig> {
+  constructor(ctx: Context, config: SmartPatchConfig = {}) {
     super(ctx, 'smartPatch', true)
+    this.config = config
+  }
+
+  private validatePath(filePath: string): string {
+    const cwd = this.config.workspaceRoot || process.cwd()
+    const resolved = path.resolve(cwd, filePath)
+    const normResolved = path.normalize(resolved).toLowerCase()
+    const normRoot = path.normalize(cwd).toLowerCase()
+
+    if (!normResolved.startsWith(normRoot)) {
+      throw new Error(`Access denied: Target path '${filePath}' is outside workspace root '${cwd}'.`)
+    }
+    return resolved
   }
 
   /**
-   * Apply single replacement chunk to target file path.
+   * Apply single replacement chunk to target file path with workspace safety checks.
    */
   public async replaceInFile(
     filePath: string,
     targetContent: string,
     replacementContent: string
   ): Promise<{ success: boolean; message: string; matchType?: string }> {
-    const resolvedPath = path.resolve(process.cwd(), filePath)
+    let resolvedPath: string
+    try {
+      resolvedPath = this.validatePath(filePath)
+    } catch (err: any) {
+      return { success: false, message: err.message }
+    }
 
     let fileText: string
     try {
@@ -52,7 +73,9 @@ export class SmartPatchService extends Service {
       await fs.writeFile(`${resolvedPath}.bak`, fileText, 'utf-8').catch(() => {})
     }
 
-    await fs.writeFile(resolvedPath, result.newContent, 'utf-8')
+    const tmpPath = `${resolvedPath}.tmp.${Date.now()}`
+    await fs.writeFile(tmpPath, result.newContent, 'utf-8')
+    await fs.rename(tmpPath, resolvedPath)
 
     return {
       success: true,
@@ -68,7 +91,12 @@ export class SmartPatchService extends Service {
     filePath: string,
     chunks: ReplacementChunk[]
   ): Promise<{ success: boolean; message: string; appliedChunks: number }> {
-    const resolvedPath = path.resolve(process.cwd(), filePath)
+    let resolvedPath: string
+    try {
+      resolvedPath = this.validatePath(filePath)
+    } catch (err: any) {
+      return { success: false, message: err.message, appliedChunks: 0 }
+    }
 
     let fileText: string
     try {
@@ -86,7 +114,9 @@ export class SmartPatchService extends Service {
       await fs.writeFile(`${resolvedPath}.bak`, fileText, 'utf-8').catch(() => {})
     }
 
-    await fs.writeFile(resolvedPath, result.newContent, 'utf-8')
+    const tmpPath = `${resolvedPath}.tmp.${Date.now()}`
+    await fs.writeFile(tmpPath, result.newContent, 'utf-8')
+    await fs.rename(tmpPath, resolvedPath)
 
     return {
       success: true,

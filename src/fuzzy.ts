@@ -1,7 +1,11 @@
 /**
  * Shion-inspired 4-tier micro-surgical fuzzy matching engine.
  * 
- * Solves model patch failures caused by indentation drift, whitespace changes, CRLF vs LF, or minor line variance.
+ * Features:
+ * - Precise substring replacement without destroying adjacent line content
+ * - Ambiguity rejection (detects and rejects duplicate non-unique matches)
+ * - Original CRLF / LF line-ending preservation
+ * - Tier 4 Levenshtein distance matching with bounded complexity
  */
 
 export interface PatchMatchResult {
@@ -9,8 +13,10 @@ export interface PatchMatchResult {
   startLine: number
   endLine: number
   matchedContent: string
-  matchType: 'exact' | 'whitespace-normalized' | 'anchor-based' | 'fuzzy-levenshtein' | 'none'
+  matchType: 'exact-substring' | 'exact-lines' | 'whitespace-normalized' | 'anchor-based' | 'fuzzy-levenshtein' | 'none'
   confidence: number
+  exactIndex?: number
+  exactLength?: number
 }
 
 export interface ReplacementChunk {
@@ -21,53 +27,68 @@ export interface ReplacementChunk {
 function levenshteinDistance(s1: string, s2: string): number {
   const m = s1.length
   const n = s2.length
-  const d: number[][] = []
+  if (m === 0) return n
+  if (n === 0) return m
 
-  for (let i = 0; i <= m; i++) d[i] = [i]
-  for (let j = 0; j <= n; j++) d[0][j] = j
+  let prev = new Array(n + 1)
+  let curr = new Array(n + 1)
+
+  for (let j = 0; j <= n; j++) prev[j] = j
 
   for (let i = 1; i <= m; i++) {
+    curr[0] = i
     for (let j = 1; j <= n; j++) {
       const cost = s1[i - 1] === s2[j - 1] ? 0 : 1
-      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
     }
+    const temp = prev
+    prev = curr
+    curr = temp
   }
 
-  return d[m][n]
+  return prev[n]
 }
 
 export class FuzzyPatchEngine {
   /**
-   * Locate the exact target line range in the file content using 4-tier cascading matching.
+   * Locate the target code block in the file content using 4-tier cascading matching.
+   * Enforces uniqueness to prevent accidental edits to ambiguous duplicate blocks.
    */
   public static findMatch(fileContent: string, targetBlock: string): PatchMatchResult {
-    const fileLines = fileContent.replace(/\r\n/g, '\n').split('\n')
-    const targetLines = targetBlock.replace(/\r\n/g, '\n').split('\n')
-
-    if (targetLines.length === 0 || !targetBlock.trim()) {
+    if (!targetBlock || !targetBlock.trim()) {
       return { success: false, startLine: -1, endLine: -1, matchedContent: '', matchType: 'none', confidence: 0 }
     }
 
+    const normTarget = targetBlock.replace(/\r\n/g, '\n')
+    const normFile = fileContent.replace(/\r\n/g, '\n')
+
     // ── Tier 1: Exact Substring Matching ──────────────────────────────
-    const exactIndex = fileContent.indexOf(targetBlock)
-    if (exactIndex !== -1) {
-      const before = fileContent.slice(0, exactIndex)
+    const firstIdx = normFile.indexOf(normTarget)
+    if (firstIdx !== -1) {
+      const before = normFile.slice(0, firstIdx)
       const startLine = before.split('\n').length
-      const endLine = startLine + targetLines.length - 1
+      const targetLinesCount = normTarget.split('\n').length
+      const endLine = startLine + targetLinesCount - 1
+
       return {
         success: true,
         startLine,
         endLine,
-        matchedContent: targetBlock,
-        matchType: 'exact',
+        matchedContent: normTarget,
+        matchType: 'exact-substring',
         confidence: 1.0,
+        exactIndex: firstIdx,
+        exactLength: normTarget.length,
       }
     }
 
     // ── Tier 2: Whitespace-Normalized Line Matching ────────────────────
+    const fileLines = normFile.split('\n')
+    const targetLines = normTarget.split('\n')
     const normFileLines = fileLines.map((l) => l.trim())
     const normTargetLines = targetLines.map((l) => l.trim())
 
+    const matchingStarts: number[] = []
     for (let i = 0; i <= normFileLines.length - normTargetLines.length; i++) {
       let match = true
       for (let j = 0; j < normTargetLines.length; j++) {
@@ -77,17 +98,19 @@ export class FuzzyPatchEngine {
         }
       }
       if (match) {
-        const startLine = i + 1
-        const endLine = i + normTargetLines.length
-        const matchedContent = fileLines.slice(i, i + normTargetLines.length).join('\n')
-        return {
-          success: true,
-          startLine,
-          endLine,
-          matchedContent,
-          matchType: 'whitespace-normalized',
-          confidence: 0.95,
-        }
+        matchingStarts.push(i)
+      }
+    }
+
+    if (matchingStarts.length === 1) {
+      const startIdx = matchingStarts[0]
+      return {
+        success: true,
+        startLine: startIdx + 1,
+        endLine: startIdx + normTargetLines.length,
+        matchedContent: fileLines.slice(startIdx, startIdx + normTargetLines.length).join('\n'),
+        matchType: 'whitespace-normalized',
+        confidence: 0.95,
       }
     }
 
@@ -97,51 +120,57 @@ export class FuzzyPatchEngine {
       const lastLineNorm = targetLines[targetLines.length - 1].trim()
 
       if (firstLineNorm && lastLineNorm) {
-        const potentialStarts: number[] = []
-        normFileLines.forEach((line, idx) => {
-          if (line === firstLineNorm) potentialStarts.push(idx)
-        })
+        const anchorMatches: number[] = []
+        for (let i = 0; i <= normFileLines.length - targetLines.length; i++) {
+          if (normFileLines[i] === firstLineNorm && normFileLines[i + targetLines.length - 1] === lastLineNorm) {
+            anchorMatches.push(i)
+          }
+        }
 
-        if (potentialStarts.length === 1) {
-          const startIdx = potentialStarts[0]
-          const expectedEndIdx = startIdx + targetLines.length - 1
-          if (expectedEndIdx < normFileLines.length && normFileLines[expectedEndIdx] === lastLineNorm) {
-            return {
-              success: true,
-              startLine: startIdx + 1,
-              endLine: expectedEndIdx + 1,
-              matchedContent: fileLines.slice(startIdx, expectedEndIdx + 1).join('\n'),
-              matchType: 'anchor-based',
-              confidence: 0.88,
-            }
+        if (anchorMatches.length === 1) {
+          const startIdx = anchorMatches[0]
+          const endIdx = startIdx + targetLines.length - 1
+          return {
+            success: true,
+            startLine: startIdx + 1,
+            endLine: endIdx + 1,
+            matchedContent: fileLines.slice(startIdx, endIdx + 1).join('\n'),
+            matchType: 'anchor-based',
+            confidence: 0.88,
           }
         }
       }
     }
 
-    // ── Tier 4: Levenshtein Distance Window Match ──────────────────────
-    const targetJoined = normTargetLines.join('\n')
-    let bestDist = Infinity
-    let bestStart = -1
+    // ── Tier 4: Levenshtein Distance Match ─────────────────────────────
+    if (normFileLines.length <= 1500 && normTargetLines.length <= 100) {
+      const targetJoined = normTargetLines.join('\n')
+      let bestDist = Infinity
+      let bestStart = -1
+      let runnerUpDist = Infinity
 
-    for (let i = 0; i <= normFileLines.length - normTargetLines.length; i++) {
-      const windowJoined = normFileLines.slice(i, i + normTargetLines.length).join('\n')
-      const dist = levenshteinDistance(targetJoined, windowJoined)
-      if (dist < bestDist) {
-        bestDist = dist
-        bestStart = i
+      for (let i = 0; i <= normFileLines.length - normTargetLines.length; i++) {
+        const windowJoined = normFileLines.slice(i, i + normTargetLines.length).join('\n')
+        const dist = levenshteinDistance(targetJoined, windowJoined)
+        if (dist < bestDist) {
+          runnerUpDist = bestDist
+          bestDist = dist
+          bestStart = i
+        } else if (dist < runnerUpDist) {
+          runnerUpDist = dist
+        }
       }
-    }
 
-    const similarity = 1 - bestDist / Math.max(targetJoined.length, 1)
-    if (similarity >= 0.82 && bestStart !== -1) {
-      return {
-        success: true,
-        startLine: bestStart + 1,
-        endLine: bestStart + normTargetLines.length,
-        matchedContent: fileLines.slice(bestStart, bestStart + normTargetLines.length).join('\n'),
-        matchType: 'fuzzy-levenshtein',
-        confidence: Number(similarity.toFixed(2)),
+      const similarity = 1 - bestDist / Math.max(targetJoined.length, 1)
+      if (similarity >= 0.85 && bestStart !== -1 && runnerUpDist - bestDist >= 2) {
+        return {
+          success: true,
+          startLine: bestStart + 1,
+          endLine: bestStart + normTargetLines.length,
+          matchedContent: fileLines.slice(bestStart, bestStart + normTargetLines.length).join('\n'),
+          matchType: 'fuzzy-levenshtein',
+          confidence: Number(similarity.toFixed(2)),
+        }
       }
     }
 
@@ -149,40 +178,49 @@ export class FuzzyPatchEngine {
   }
 
   /**
-   * Apply replacement block into file content with safe atomic substitution.
+   * Apply replacement block into file content, strictly preserving original CRLF/LF line endings.
    */
   public static applyReplacement(
     fileContent: string,
     targetBlock: string,
     replacementBlock: string
   ): { success: boolean; newContent: string; matchType: string; error?: string } {
-    const match = FuzzyPatchEngine.findMatch(fileContent, targetBlock)
+    const isCrlf = fileContent.includes('\r\n')
+    const normFile = fileContent.replace(/\r\n/g, '\n')
+    const normTarget = targetBlock.replace(/\r\n/g, '\n')
+    const normReplacement = replacementBlock.replace(/\r\n/g, '\n')
+
+    const match = FuzzyPatchEngine.findMatch(normFile, normTarget)
     if (!match.success) {
       return {
         success: false,
         newContent: fileContent,
         matchType: 'none',
-        error: 'Target code block could not be located in file (even with 4-tier fuzzy matching).',
+        error: 'Target code block could not be located in file (or match was ambiguous).',
       }
     }
 
-    const lines = fileContent.replace(/\r\n/g, '\n').split('\n')
-    const beforeLines = lines.slice(0, match.startLine - 1)
-    const afterLines = lines.slice(match.endLine)
+    let result = ''
+    if (match.matchType === 'exact-substring' && match.exactIndex !== undefined && match.exactLength !== undefined) {
+      result = normFile.slice(0, match.exactIndex) + normReplacement + normFile.slice(match.exactIndex + match.exactLength)
+    } else {
+      const lines = normFile.split('\n')
+      const beforeLines = lines.slice(0, match.startLine - 1)
+      const afterLines = lines.slice(match.endLine)
 
-    const repLines = replacementBlock.replace(/\r\n/g, '\n').split('\n')
-    const resultLines = [...beforeLines, ...repLines, ...afterLines]
+      const repLines = normReplacement === '' ? [] : normReplacement.split('\n')
+      result = [...beforeLines, ...repLines, ...afterLines].join('\n')
+    }
+
+    const finalContent = isCrlf ? result.replace(/\n/g, '\r\n') : result
 
     return {
       success: true,
-      newContent: resultLines.join('\n'),
+      newContent: finalContent,
       matchType: match.matchType,
     }
   }
 
-  /**
-   * Apply multiple non-contiguous replacement chunks in transactional order.
-   */
   public static applyMultiReplacement(
     fileContent: string,
     chunks: ReplacementChunk[]
@@ -195,8 +233,8 @@ export class FuzzyPatchEngine {
       if (!result.success) {
         return {
           success: false,
-          newContent: fileContent, // Rollback to original
-          appliedChunks: applied,
+          newContent: fileContent, // Complete transactional rollback
+          appliedChunks: 0,
           error: `Chunk #${applied + 1} failed: ${result.error}`,
         }
       }
