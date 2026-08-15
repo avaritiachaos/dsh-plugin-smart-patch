@@ -1,7 +1,7 @@
 /**
  * Shion-inspired 4-tier micro-surgical fuzzy matching engine.
  * 
- * Solves model patch failures caused by indentation drift, whitespace changes, or CRLF vs LF.
+ * Solves model patch failures caused by indentation drift, whitespace changes, CRLF vs LF, or minor line variance.
  */
 
 export interface PatchMatchResult {
@@ -11,6 +11,29 @@ export interface PatchMatchResult {
   matchedContent: string
   matchType: 'exact' | 'whitespace-normalized' | 'anchor-based' | 'fuzzy-levenshtein' | 'none'
   confidence: number
+}
+
+export interface ReplacementChunk {
+  targetContent: string
+  replacementContent: string
+}
+
+function levenshteinDistance(s1: string, s2: string): number {
+  const m = s1.length
+  const n = s2.length
+  const d: number[][] = []
+
+  for (let i = 0; i <= m; i++) d[i] = [i]
+  for (let j = 0; j <= n; j++) d[0][j] = j
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = s1[i - 1] === s2[j - 1] ? 0 : 1
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+    }
+  }
+
+  return d[m][n]
 }
 
 export class FuzzyPatchEngine {
@@ -96,6 +119,32 @@ export class FuzzyPatchEngine {
       }
     }
 
+    // ── Tier 4: Levenshtein Distance Window Match ──────────────────────
+    const targetJoined = normTargetLines.join('\n')
+    let bestDist = Infinity
+    let bestStart = -1
+
+    for (let i = 0; i <= normFileLines.length - normTargetLines.length; i++) {
+      const windowJoined = normFileLines.slice(i, i + normTargetLines.length).join('\n')
+      const dist = levenshteinDistance(targetJoined, windowJoined)
+      if (dist < bestDist) {
+        bestDist = dist
+        bestStart = i
+      }
+    }
+
+    const similarity = 1 - bestDist / Math.max(targetJoined.length, 1)
+    if (similarity >= 0.82 && bestStart !== -1) {
+      return {
+        success: true,
+        startLine: bestStart + 1,
+        endLine: bestStart + normTargetLines.length,
+        matchedContent: fileLines.slice(bestStart, bestStart + normTargetLines.length).join('\n'),
+        matchType: 'fuzzy-levenshtein',
+        confidence: Number(similarity.toFixed(2)),
+      }
+    }
+
     return { success: false, startLine: -1, endLine: -1, matchedContent: '', matchType: 'none', confidence: 0 }
   }
 
@@ -129,5 +178,32 @@ export class FuzzyPatchEngine {
       newContent: resultLines.join('\n'),
       matchType: match.matchType,
     }
+  }
+
+  /**
+   * Apply multiple non-contiguous replacement chunks in transactional order.
+   */
+  public static applyMultiReplacement(
+    fileContent: string,
+    chunks: ReplacementChunk[]
+  ): { success: boolean; newContent: string; appliedChunks: number; error?: string } {
+    let current = fileContent
+    let applied = 0
+
+    for (const chunk of chunks) {
+      const result = this.applyReplacement(current, chunk.targetContent, chunk.replacementContent)
+      if (!result.success) {
+        return {
+          success: false,
+          newContent: fileContent, // Rollback to original
+          appliedChunks: applied,
+          error: `Chunk #${applied + 1} failed: ${result.error}`,
+        }
+      }
+      current = result.newContent
+      applied++
+    }
+
+    return { success: true, newContent: current, appliedChunks: applied }
   }
 }

@@ -1,7 +1,7 @@
 import { Context, Service, Schema } from 'cordis'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
-import { FuzzyPatchEngine, PatchMatchResult } from './fuzzy.js'
+import { FuzzyPatchEngine, PatchMatchResult, ReplacementChunk } from './fuzzy.js'
 
 export interface SmartPatchConfig {
   /** Create automatic .bak backup files before modifying. Default: false */
@@ -27,7 +27,7 @@ export class SmartPatchService extends Service {
   }
 
   /**
-   * Apply replacement chunk to target file path.
+   * Apply single replacement chunk to target file path.
    */
   public async replaceInFile(
     filePath: string,
@@ -60,9 +60,43 @@ export class SmartPatchService extends Service {
       matchType: result.matchType,
     }
   }
+
+  /**
+   * Apply multiple non-contiguous replacement chunks in transactional order.
+   */
+  public async multiReplaceInFile(
+    filePath: string,
+    chunks: ReplacementChunk[]
+  ): Promise<{ success: boolean; message: string; appliedChunks: number }> {
+    const resolvedPath = path.resolve(process.cwd(), filePath)
+
+    let fileText: string
+    try {
+      fileText = await fs.readFile(resolvedPath, 'utf-8')
+    } catch (err) {
+      return { success: false, message: `Failed to read file '${filePath}': ${err}`, appliedChunks: 0 }
+    }
+
+    const result = FuzzyPatchEngine.applyMultiReplacement(fileText, chunks)
+    if (!result.success) {
+      return { success: false, message: result.error || 'Multi-patch failed.', appliedChunks: result.appliedChunks }
+    }
+
+    if (this.config.createBackup) {
+      await fs.writeFile(`${resolvedPath}.bak`, fileText, 'utf-8').catch(() => {})
+    }
+
+    await fs.writeFile(resolvedPath, result.newContent, 'utf-8')
+
+    return {
+      success: true,
+      message: `Successfully applied ${result.appliedChunks} micro-surgical patch chunks to '${filePath}'.`,
+      appliedChunks: result.appliedChunks,
+    }
+  }
 }
 
-export { FuzzyPatchEngine, PatchMatchResult }
+export { FuzzyPatchEngine, PatchMatchResult, ReplacementChunk }
 
 export default function apply(ctx: Context, config: SmartPatchConfig = {}) {
   ctx.plugin(SmartPatchService, config)
