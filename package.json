@@ -1,0 +1,44 @@
+{
+  "name": "@shion-lab/dsh-plugin-smart-patch",
+  "version": "0.1.0",
+  "description": "Micro-surgical fault-tolerant code patching engine with 4-tier fuzzy matching for DeepSeek Harness (dsh).",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test test/patch.test.mjs"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "patch",
+    "diff",
+    "fuzzy-match",
+    "file-edit"
+  ],
+  "author": "Shion Lab",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/avaritiachaos/dsh-plugin-smart-patch.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "cordis": "^3.0.0"
+  },
+  "devDependencies": {
+    "cordis": "^3.18.0",
+    "typescript": "^5.4.5",
+    "@types/node": "^20.12.7"
+  }
+}
