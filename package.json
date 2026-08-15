@@ -10,6 +10,13 @@
     "README.md",
     "LICENSE"
   ],
+  "dsh": {
+    "displayName": "Smart Patch Diff Engine",
+    "description": "4-tier micro-surgical fuzzy code patching engine surviving indentation drift and CRLF",
+    "icon": "code",
+    "service": "smartPatch",
+    "category": "developer"
+  },
   "scripts": {
     "build": "tsc",
     "test": "node --test test/patch.test.mjs"
@@ -18,11 +25,11 @@
     "deepseek",
     "deepseek-harness",
     "dsh",
+    "dsh-plugin",
     "cordis",
     "patch",
     "diff",
-    "fuzzy-match",
-    "file-edit"
+    "fuzzy-match"
   ],
   "author": "Shion Lab",
   "license": "MIT",
@@ -34,6 +41,7 @@
     "access": "public"
   },
   "peerDependencies": {
+    "@deepseek-ai/dsh": "*",
     "cordis": "^3.0.0"
   },
   "devDependencies": {
