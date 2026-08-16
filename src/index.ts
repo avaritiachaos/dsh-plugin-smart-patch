@@ -23,135 +23,229 @@ declare module 'cordis' {
 
 /**
  * DeepSeek Harness Micro-surgical Code Patching Service.
+ *
+ * Safety model (C4/C7/M14):
+ * - containment is checked on *realpaths*: symlinks/junctions are resolved and
+ *   the resolved target must stay inside the resolved workspace root;
+ * - read-modify-write cycles are serialized per file via an async queue;
+ * - writes go to a unique temp file that inherits the original mode, then
+ *   rename; an mtime+size CAS rejects overwriting externally modified files;
+ * - backups are refused when the `.bak` path is already a symlink.
  */
 export class SmartPatchService extends Service<SmartPatchConfig> {
+  /** Cordis validates plugin config against this schema. */
+  public static Config = SmartPatchConfig
+
+  /** Per-realpath serialization queues (M14: no lost updates between our calls). */
+  private fileQueues = new Map<string, Promise<unknown>>()
+
   constructor(ctx: Context, config: SmartPatchConfig = {}) {
     super(ctx, 'smartPatch', true)
-    this.config = config
+    this.config = SmartPatchConfig(config) as SmartPatchConfig
   }
 
-  private validatePath(filePath: string): string {
-    const cwd = this.config.workspaceRoot || process.cwd()
-    const resolved = path.resolve(cwd, filePath)
-    const normResolved = path.normalize(resolved).toLowerCase()
-    const normRoot = path.normalize(cwd).toLowerCase()
+  /**
+   * Run `task` exclusively for `key`, serializing concurrent callers.
+   */
+  private enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const prev = this.fileQueues.get(key) ?? Promise.resolve()
+    const run = prev.then(task, task)
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.fileQueues.set(key, tail)
+    tail.then(() => {
+      if (this.fileQueues.get(key) === tail) this.fileQueues.delete(key)
+    })
+    return run
+  }
 
-    // Proper path segment boundary check (prevents D:\work2 bypass when root is D:\work)
-    const isInside = normResolved === normRoot || normResolved.startsWith(normRoot.endsWith(path.sep) ? normRoot : `${normRoot}${path.sep}`)
+  /**
+   * Resolve `filePath` against the workspace root, following symlinks/junctions,
+   * and verify the resolved target stays inside the resolved root.
+   * Returns the canonical (realpath) target.
+   */
+  private async resolveInsideWorkspace(filePath: string): Promise<string> {
+    const rootRaw = this.config.workspaceRoot || process.cwd()
+    const rootAbs = path.resolve(rootRaw)
+    const targetAbs = path.resolve(rootAbs, filePath)
 
-    if (!isInside) {
-      throw new Error(`Access denied: Target path '${filePath}' is outside workspace root '${cwd}'.`)
+    // 1. Cheap segment-aware boundary check on the raw absolute paths (blocks
+    //    D:\work2 when root is D:\work before any fs work).
+    const insideSegments = (abs: string, root: string): boolean =>
+      abs === root || abs.startsWith(root.endsWith(path.sep) ? root : root + path.sep)
+    if (!insideSegments(targetAbs, rootAbs)) {
+      throw new Error(`Access denied: Target path '${filePath}' is outside workspace root '${rootRaw}'.`)
     }
-    return resolved
+
+    // 2. Canonicalize: resolve junctions/symlinks/reparse points for the root
+    //    and the target itself (C4). realpath(targetAbs) follows file-level
+    //    symlinks; if the file does not exist yet, resolve its parent dir.
+    const realRoot = await fs.realpath(rootAbs).catch(() => null)
+    if (!realRoot) {
+      throw new Error(`Workspace root does not exist: '${rootRaw}'.`)
+    }
+    const realTarget = await fs
+      .realpath(targetAbs)
+      .catch(async () => {
+        const realDir = await fs.realpath(path.dirname(targetAbs)).catch(() => null)
+        if (!realDir) {
+          throw new Error(`Target directory does not exist: '${path.dirname(filePath)}'.`)
+        }
+        return path.join(realDir, path.basename(targetAbs))
+      })
+
+    // 3. Re-check containment on canonical paths. Case-insensitive only on
+    //    Windows; POSIX keeps case-sensitive semantics (C4).
+    const fold = (s: string): string => (process.platform === 'win32' ? s.toLowerCase() : s)
+    const cmpTarget = fold(realTarget)
+    const cmpRoot = fold(realRoot)
+    if (!(cmpTarget === cmpRoot || cmpTarget.startsWith(cmpRoot.endsWith(path.sep) ? cmpRoot : cmpRoot + path.sep))) {
+      throw new Error(
+        `Access denied: '${filePath}' resolves outside workspace root '${rootRaw}' (symlink/junction escape).`,
+      )
+    }
+    return realTarget
+  }
+
+  /**
+   * Serialized read-patch-write for one file.
+   */
+  private async patchFile(
+    filePath: string,
+    mutate: (fileText: string) => Promise<{ success: boolean; message: string; newContent?: string; matchType?: string; appliedChunks?: number }>,
+  ): Promise<{ success: boolean; message: string; matchType?: string; appliedChunks?: number }> {
+    const lockKey = path.resolve(this.config.workspaceRoot || process.cwd(), filePath)
+    return this.enqueue(lockKey, async () => {
+      let realPath: string
+      try {
+        realPath = await this.resolveInsideWorkspace(filePath)
+      } catch (err: any) {
+        return { success: false, message: err.message }
+      }
+
+      // Snapshot before reading so the CAS can detect external writers (C7/M14).
+      const statBefore = await fs.stat(realPath).catch((err) => {
+        return null
+      })
+      if (!statBefore) {
+        return { success: false, message: `Failed to stat file '${filePath}': file may not exist.` }
+      }
+
+      let fileText: string
+      try {
+        fileText = await fs.readFile(realPath, 'utf-8')
+      } catch (err) {
+        return { success: false, message: `Failed to read file '${filePath}': ${err}` }
+      }
+
+      const patched = await mutate(fileText)
+      if (!patched.success || patched.newContent === undefined) {
+        return { success: patched.success, message: patched.message, matchType: patched.matchType, appliedChunks: patched.appliedChunks ?? 0 }
+      }
+
+      // Backup with symlink protection: a pre-existing .bak symlink must never
+      // redirect our backup bytes outside the workspace (C7).
+      if (this.config.createBackup) {
+        const bakPath = `${realPath}.bak`
+        const bakLstat = await fs.lstat(bakPath).catch(() => null)
+        if (bakLstat?.isSymbolicLink()) {
+          return { success: false, message: `Backup refused: '${filePath}.bak' is a symlink.`, appliedChunks: 0 }
+        }
+        try {
+          await fs.writeFile(bakPath, fileText, 'utf-8')
+        } catch (err) {
+          return { success: false, message: `Backup creation failed for '${filePath}': ${err}`, appliedChunks: 0 }
+        }
+      }
+
+      // Unique temp name: pid + timestamp + random suffix (C7 collision-proof).
+      const tmpPath = `${realPath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}`
+      try {
+        await fs.writeFile(tmpPath, patched.newContent, 'utf-8')
+        // Preserve the original file's mode (executable bit / permissions, C7).
+        try {
+          await fs.chmod(tmpPath, statBefore.mode)
+        } catch {
+          /* best-effort (Windows has limited chmod semantics) */
+        }
+        // CAS: abort if the file changed on disk while we were patching.
+        const statAfter = await fs.stat(realPath).catch(() => null)
+        if (statAfter && (statAfter.mtimeMs !== statBefore.mtimeMs || statAfter.size !== statBefore.size)) {
+          await fs.unlink(tmpPath).catch(() => {})
+          return {
+            success: false,
+            message: `File '${filePath}' changed on disk during patch; aborted to avoid lost update.`,
+            appliedChunks: 0,
+          }
+        }
+        await fs.rename(tmpPath, realPath)
+      } catch (err) {
+        await fs.unlink(tmpPath).catch(() => {})
+        return { success: false, message: `Failed to commit patch to '${filePath}': ${err}`, appliedChunks: 0 }
+      }
+
+      return {
+        success: true,
+        message: patched.message,
+        matchType: patched.matchType,
+        appliedChunks: patched.appliedChunks,
+      }
+    })
   }
 
   /**
    * Apply single replacement chunk to target file path with workspace safety checks.
    */
-  public async replaceInFile(
+  public replaceInFile(
     filePath: string,
     targetContent: string,
     replacementContent: string
   ): Promise<{ success: boolean; message: string; matchType?: string }> {
-    let resolvedPath: string
-    try {
-      resolvedPath = this.validatePath(filePath)
-    } catch (err: any) {
-      return { success: false, message: err.message }
-    }
-
-    let fileText: string
-    try {
-      fileText = await fs.readFile(resolvedPath, 'utf-8')
-    } catch (err) {
-      return { success: false, message: `Failed to read file '${filePath}': ${err}` }
-    }
-
-    const result = FuzzyPatchEngine.applyReplacement(fileText, targetContent, replacementContent)
-    if (!result.success) {
-      return { success: false, message: result.error || 'Patch failed to match target block.' }
-    }
-
-    if (this.config.createBackup) {
-      try {
-        await fs.writeFile(`${resolvedPath}.bak`, fileText, 'utf-8')
-      } catch (err) {
-        return { success: false, message: `Backup creation failed for '${filePath}': ${err}` }
+    return this.patchFile(filePath, async (fileText) => {
+      const result = FuzzyPatchEngine.applyReplacement(fileText, targetContent, replacementContent)
+      if (!result.success) {
+        return { success: false, message: result.error || 'Patch failed to match target block.' }
       }
-    }
-
-    const tmpPath = `${resolvedPath}.tmp.${Date.now()}`
-    try {
-      await fs.writeFile(tmpPath, result.newContent, 'utf-8')
-      await fs.rename(tmpPath, resolvedPath)
-    } catch (err) {
-      try { await fs.unlink(tmpPath) } catch {}
-      return { success: false, message: `Failed to commit patch to '${filePath}': ${err}` }
-    }
-
-    return {
-      success: true,
-      message: `Successfully applied micro-surgical patch to '${filePath}' (Match strategy: ${result.matchType}).`,
-      matchType: result.matchType,
-    }
+      return {
+        success: true,
+        message: `Successfully applied micro-surgical patch to '${filePath}' (Match strategy: ${result.matchType}).`,
+        newContent: result.newContent,
+        matchType: result.matchType,
+      }
+    })
   }
 
   /**
    * Apply multiple non-contiguous replacement chunks in transactional order.
    */
-  public async multiReplaceInFile(
+  public multiReplaceInFile(
     filePath: string,
     chunks: ReplacementChunk[]
   ): Promise<{ success: boolean; message: string; appliedChunks: number }> {
-    let resolvedPath: string
-    try {
-      resolvedPath = this.validatePath(filePath)
-    } catch (err: any) {
-      return { success: false, message: err.message, appliedChunks: 0 }
-    }
-
-    let fileText: string
-    try {
-      fileText = await fs.readFile(resolvedPath, 'utf-8')
-    } catch (err) {
-      return { success: false, message: `Failed to read file '${filePath}': ${err}`, appliedChunks: 0 }
-    }
-
-    const result = FuzzyPatchEngine.applyMultiReplacement(fileText, chunks)
-    if (!result.success) {
-      return { success: false, message: result.error || 'Multi-patch failed.', appliedChunks: result.appliedChunks }
-    }
-
-    if (this.config.createBackup) {
-      try {
-        await fs.writeFile(`${resolvedPath}.bak`, fileText, 'utf-8')
-      } catch (err) {
-        return { success: false, message: `Backup creation failed for '${filePath}': ${err}`, appliedChunks: 0 }
+    return this.patchFile(filePath, async (fileText) => {
+      const result = FuzzyPatchEngine.applyMultiReplacement(fileText, chunks)
+      if (!result.success) {
+        return { success: false, message: result.error || 'Multi-patch failed.', appliedChunks: result.appliedChunks }
       }
-    }
-
-    const tmpPath = `${resolvedPath}.tmp.${Date.now()}`
-    try {
-      await fs.writeFile(tmpPath, result.newContent, 'utf-8')
-      await fs.rename(tmpPath, resolvedPath)
-    } catch (err) {
-      try { await fs.unlink(tmpPath) } catch {}
-      return { success: false, message: `Failed to commit multi-patch to '${filePath}': ${err}`, appliedChunks: 0 }
-    }
-
-    return {
-      success: true,
-      message: `Successfully applied ${result.appliedChunks} micro-surgical patch chunks to '${filePath}'.`,
-      appliedChunks: result.appliedChunks,
-    }
+      return {
+        success: true,
+        message: `Successfully applied ${result.appliedChunks} micro-surgical patch chunks to '${filePath}'.`,
+        newContent: result.newContent,
+        appliedChunks: result.appliedChunks,
+      }
+    }).then((r) => ({
+      success: r.success,
+      message: r.message,
+      appliedChunks: r.appliedChunks ?? 0,
+    }))
   }
 }
 
 export { FuzzyPatchEngine, PatchMatchResult, ReplacementChunk }
 
 export default function apply(ctx: Context, config: SmartPatchConfig = {}) {
-  ctx.plugin(SmartPatchService, config)
-  ctx.on('ready', () => {
-    ctx.logger.info('[dsh-plugin-smart-patch] 4-tier micro-surgical diff engine ready.')
-  })
+  // Validate + apply defaults at the entry point (M7 pattern).
+  ctx.plugin(SmartPatchService, SmartPatchConfig(config))
 }
