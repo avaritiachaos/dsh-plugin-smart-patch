@@ -36,7 +36,10 @@ export class SmartPatchService extends Service<SmartPatchConfig> {
     const normResolved = path.normalize(resolved).toLowerCase()
     const normRoot = path.normalize(cwd).toLowerCase()
 
-    if (!normResolved.startsWith(normRoot)) {
+    // Proper path segment boundary check (prevents D:\work2 bypass when root is D:\work)
+    const isInside = normResolved === normRoot || normResolved.startsWith(normRoot.endsWith(path.sep) ? normRoot : `${normRoot}${path.sep}`)
+
+    if (!isInside) {
       throw new Error(`Access denied: Target path '${filePath}' is outside workspace root '${cwd}'.`)
     }
     return resolved
@@ -70,12 +73,21 @@ export class SmartPatchService extends Service<SmartPatchConfig> {
     }
 
     if (this.config.createBackup) {
-      await fs.writeFile(`${resolvedPath}.bak`, fileText, 'utf-8').catch(() => {})
+      try {
+        await fs.writeFile(`${resolvedPath}.bak`, fileText, 'utf-8')
+      } catch (err) {
+        return { success: false, message: `Backup creation failed for '${filePath}': ${err}` }
+      }
     }
 
     const tmpPath = `${resolvedPath}.tmp.${Date.now()}`
-    await fs.writeFile(tmpPath, result.newContent, 'utf-8')
-    await fs.rename(tmpPath, resolvedPath)
+    try {
+      await fs.writeFile(tmpPath, result.newContent, 'utf-8')
+      await fs.rename(tmpPath, resolvedPath)
+    } catch (err) {
+      try { await fs.unlink(tmpPath) } catch {}
+      return { success: false, message: `Failed to commit patch to '${filePath}': ${err}` }
+    }
 
     return {
       success: true,
@@ -111,12 +123,21 @@ export class SmartPatchService extends Service<SmartPatchConfig> {
     }
 
     if (this.config.createBackup) {
-      await fs.writeFile(`${resolvedPath}.bak`, fileText, 'utf-8').catch(() => {})
+      try {
+        await fs.writeFile(`${resolvedPath}.bak`, fileText, 'utf-8')
+      } catch (err) {
+        return { success: false, message: `Backup creation failed for '${filePath}': ${err}`, appliedChunks: 0 }
+      }
     }
 
     const tmpPath = `${resolvedPath}.tmp.${Date.now()}`
-    await fs.writeFile(tmpPath, result.newContent, 'utf-8')
-    await fs.rename(tmpPath, resolvedPath)
+    try {
+      await fs.writeFile(tmpPath, result.newContent, 'utf-8')
+      await fs.rename(tmpPath, resolvedPath)
+    } catch (err) {
+      try { await fs.unlink(tmpPath) } catch {}
+      return { success: false, message: `Failed to commit multi-patch to '${filePath}': ${err}`, appliedChunks: 0 }
+    }
 
     return {
       success: true,

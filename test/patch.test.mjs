@@ -9,8 +9,18 @@ test('FuzzyPatchEngine preserves inline prefix and suffix during substring repla
 
   const res = FuzzyPatchEngine.applyReplacement(original, target, replacement)
   assert.strictEqual(res.success, true)
-  assert.strictEqual(res.matchType, 'exact-substring')
+  assert.strictEqual(res.matchType, 'exact')
   assert.strictEqual(res.newContent, 'const prefix = true; return a * b; const suffix = true;')
+})
+
+test('FuzzyPatchEngine rejects ambiguous duplicate exact blocks', () => {
+  const duplicateCode = 'function a() { return 1; }\nfunction b() { return 1; }'
+  const ambiguousTarget = 'return 1;'
+  const replacement = 'return 2;'
+
+  const res = FuzzyPatchEngine.applyReplacement(duplicateCode, ambiguousTarget, replacement)
+  assert.strictEqual(res.success, false)
+  assert.strictEqual(res.error.includes('Ambiguous'), true)
 })
 
 test('FuzzyPatchEngine preserves CRLF line endings', () => {
