@@ -3,7 +3,7 @@
  * 
  * Features:
  * - Precise substring replacement without destroying adjacent line content
- * - Ambiguity rejection (detects and rejects duplicate non-unique matches)
+ * - Ambiguity rejection (detects and rejects duplicate non-unique matches across all tiers)
  * - Original CRLF / LF line-ending preservation
  * - Tier 4 Levenshtein distance matching with bounded complexity
  */
@@ -13,10 +13,11 @@ export interface PatchMatchResult {
   startLine: number
   endLine: number
   matchedContent: string
-  matchType: 'exact-substring' | 'exact-lines' | 'whitespace-normalized' | 'anchor-based' | 'fuzzy-levenshtein' | 'none'
+  matchType: 'exact' | 'exact-substring' | 'whitespace-normalized' | 'anchor-based' | 'fuzzy-levenshtein' | 'none'
   confidence: number
   exactIndex?: number
   exactLength?: number
+  error?: string
 }
 
 export interface ReplacementChunk {
@@ -56,7 +57,7 @@ export class FuzzyPatchEngine {
    */
   public static findMatch(fileContent: string, targetBlock: string): PatchMatchResult {
     if (!targetBlock || !targetBlock.trim()) {
-      return { success: false, startLine: -1, endLine: -1, matchedContent: '', matchType: 'none', confidence: 0 }
+      return { success: false, startLine: -1, endLine: -1, matchedContent: '', matchType: 'none', confidence: 0, error: 'Empty target block.' }
     }
 
     const normTarget = targetBlock.replace(/\r\n/g, '\n')
@@ -65,6 +66,20 @@ export class FuzzyPatchEngine {
     // ── Tier 1: Exact Substring Matching ──────────────────────────────
     const firstIdx = normFile.indexOf(normTarget)
     if (firstIdx !== -1) {
+      // Ambiguity check: if targetBlock appears multiple times, reject with ambiguity error!
+      const secondIdx = normFile.indexOf(normTarget, firstIdx + 1)
+      if (secondIdx !== -1) {
+        return {
+          success: false,
+          startLine: -1,
+          endLine: -1,
+          matchedContent: '',
+          matchType: 'none',
+          confidence: 0,
+          error: 'Ambiguous matches: target block occurs multiple times in file. Please provide more context.',
+        }
+      }
+
       const before = normFile.slice(0, firstIdx)
       const startLine = before.split('\n').length
       const targetLinesCount = normTarget.split('\n').length
@@ -75,7 +90,7 @@ export class FuzzyPatchEngine {
         startLine,
         endLine,
         matchedContent: normTarget,
-        matchType: 'exact-substring',
+        matchType: 'exact',
         confidence: 1.0,
         exactIndex: firstIdx,
         exactLength: normTarget.length,
@@ -111,6 +126,16 @@ export class FuzzyPatchEngine {
         matchedContent: fileLines.slice(startIdx, startIdx + normTargetLines.length).join('\n'),
         matchType: 'whitespace-normalized',
         confidence: 0.95,
+      }
+    } else if (matchingStarts.length > 1) {
+      return {
+        success: false,
+        startLine: -1,
+        endLine: -1,
+        matchedContent: '',
+        matchType: 'none',
+        confidence: 0,
+        error: `Ambiguous matches: found ${matchingStarts.length} identical whitespace-normalized candidates in file.`,
       }
     }
 
@@ -174,7 +199,7 @@ export class FuzzyPatchEngine {
       }
     }
 
-    return { success: false, startLine: -1, endLine: -1, matchedContent: '', matchType: 'none', confidence: 0 }
+    return { success: false, startLine: -1, endLine: -1, matchedContent: '', matchType: 'none', confidence: 0, error: 'Target code block could not be located in file.' }
   }
 
   /**
@@ -196,12 +221,12 @@ export class FuzzyPatchEngine {
         success: false,
         newContent: fileContent,
         matchType: 'none',
-        error: 'Target code block could not be located in file (or match was ambiguous).',
+        error: match.error || 'Target code block could not be located in file.',
       }
     }
 
     let result = ''
-    if (match.matchType === 'exact-substring' && match.exactIndex !== undefined && match.exactLength !== undefined) {
+    if ((match.matchType === 'exact' || match.matchType === 'exact-substring') && match.exactIndex !== undefined && match.exactLength !== undefined) {
       result = normFile.slice(0, match.exactIndex) + normReplacement + normFile.slice(match.exactIndex + match.exactLength)
     } else {
       const lines = normFile.split('\n')
