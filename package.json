@@ -19,7 +19,6 @@
   },
   "scripts": {
     "build": "tsc",
-    "prepare": "tsc",
     "prepack": "tsc",
     "pretest": "tsc",
     "test": "node --test"
