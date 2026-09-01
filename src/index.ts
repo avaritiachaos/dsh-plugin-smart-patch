@@ -18,6 +18,8 @@ export const SmartPatchConfig: Schema<SmartPatchConfig> = Schema.object({
 declare module 'cordis' {
   interface Context {
     smartPatch: SmartPatchService
+    fs?: any
+    logger?: any
   }
 }
 
@@ -248,4 +250,77 @@ export { FuzzyPatchEngine, PatchMatchResult, ReplacementChunk }
 export default function apply(ctx: Context, config: SmartPatchConfig = {}) {
   // Validate + apply defaults at the entry point (M7 pattern).
   ctx.plugin(SmartPatchService, SmartPatchConfig(config))
+
+  // Intercept ctx.fs.editText when fs service is loaded to transparently recover from exact-match failures
+  ctx.inject(['fs'], (ctx) => {
+    const fsService = ctx.fs as any
+    if (!fsService || typeof fsService.editText !== 'function') return
+
+    // Guard against double wrapping on reload
+    if (fsService.__smartPatchHooked) return
+    fsService.__smartPatchHooked = true
+
+    const originalEditText = fsService.editText.bind(fsService)
+
+    fsService.editText = async function (
+      target: any,
+      edit: { oldString: string; newString: string; replaceAll?: boolean },
+      expected: any,
+      signal: any,
+      sandboxPolicy: any
+    ) {
+      try {
+        // Tier 1: Try standard exact edit
+        return await originalEditText(target, edit, expected, signal, sandboxPolicy)
+      } catch (err: any) {
+        // If standard edit fails because old_string was not found, trigger smart fuzzy recovery
+        const isNotFound =
+          err?.code === 'FS_EDIT_NOT_FOUND' ||
+          (typeof err?.message === 'string' && err.message.includes('old_string was not found'))
+
+        if (!isNotFound || !edit.oldString) {
+          throw err
+        }
+
+        // Read raw file content
+        let rawContent: string
+        try {
+          rawContent = await fsService.readText(target, signal)
+        } catch {
+          throw err
+        }
+
+        // Tier 2-4: Fuzzy match and apply replacement
+        const patchResult = FuzzyPatchEngine.applyReplacement(rawContent, edit.oldString, edit.newString)
+        if (!patchResult.success) {
+          // If fuzzy recovery also fails, bubble up the original error
+          throw err
+        }
+
+        // Apply write atomically with version guard
+        const writeExpected =
+          expected?.kind === 'replaceIfVersion'
+            ? { kind: 'replaceIfVersion', version: expected.version }
+            : undefined
+
+        const writeResult = await fsService.writeText(
+          target,
+          patchResult.newContent,
+          writeExpected,
+          signal,
+          sandboxPolicy
+        )
+
+        ctx.logger?.info?.(
+          `[dsh-plugin-smart-patch] Successfully recovered edit on "${target.displayPath || target.targetKey || 'file'}" (Strategy: ${patchResult.matchType})`
+        )
+
+        return {
+          version: writeResult.version,
+          before: rawContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
+          after: patchResult.newContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
+        }
+      }
+    }
+  })
 }

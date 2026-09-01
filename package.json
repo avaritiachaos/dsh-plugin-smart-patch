@@ -1,6 +1,6 @@
 {
   "name": "@shion-lab/dsh-plugin-smart-patch",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Micro-surgical fault-tolerant code patching engine with 4-tier fuzzy matching for DeepSeek Harness (dsh).",
   "main": "dist/index.js",
